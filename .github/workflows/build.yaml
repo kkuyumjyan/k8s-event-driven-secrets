@@ -1,0 +1,23 @@
+name: Release Docker Image
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+    release:
+      name: Release Docker Image
+      runs-on: ubuntu-latest
+      steps:
+        - name: Checkout code
+          uses: actions/checkout@v4
+
+        - name: Login to DockerHub
+          run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+        - name: Build Docker Image
+          run: make docker-build IMG_VERSION=${{ github.sha }}
+
+        - name: Push Docker Image
+          run: make docker-push IMG_VERSION=${{ github.sha }}
