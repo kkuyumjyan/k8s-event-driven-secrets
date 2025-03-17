@@ -20,6 +20,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -114,11 +119,31 @@ func (r *EventDrivenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, err
 	}
 
-	// Apply Kubernetes Secret
-	err = utils.CreateOrUpdateK8sSecret(ctx, r.Client, req.NamespacedName.Namespace, targetSecretName, secretValue)
+	// ✅ Fetch the existing Kubernetes Secret
+	var targetSecret corev1.Secret
+	err = r.Client.Get(ctx, client.ObjectKey{Namespace: req.Namespace, Name: targetSecretName}, &targetSecret)
 	if err != nil {
-		fmt.Println("Failed to create/update Kubernetes secret:", err)
-		return ctrl.Result{}, err
+		if errors.IsNotFound(err) {
+			// Secret does not exist -> Recreate it from AWS/GCP
+			fmt.Println("🔍 Target secret is missing, recreating...")
+		} else {
+			// Other errors
+			return ctrl.Result{}, err
+		}
+	}
+
+	// ✅ Compare current secret with expected secret
+	if !utils.CompareSecretData(targetSecret.Data, secretValue) {
+		fmt.Println("⚠️ Secret modified manually! Restoring original version...")
+
+		// Restore the correct secret
+		err := utils.CreateOrUpdateK8sSecret(ctx, r.Client, req.Namespace, targetSecretName, secretValue)
+		if err != nil {
+			fmt.Println("❌ Failed to restore Kubernetes secret:", err)
+			return ctrl.Result{}, err
+		}
+	} else {
+		fmt.Println("✅ Secret is up-to-date, no changes needed.")
 	}
 
 	// Rollout the Deployments that reference the secret
@@ -128,7 +153,7 @@ func (r *EventDrivenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, err
 	}
 
-	fmt.Printf("Secret value: %s\n", secretValue)
+	fmt.Printf("Secret value: %s\n", utils.MaskSecretData(secretValue))
 
 	// Log what we received.
 	fmt.Printf("Detected EventDrivenSecret: CloudProvider=%s, Region=%s, SecretPath=%s\n",
@@ -179,8 +204,54 @@ func (r *EventDrivenSecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("failed to create index for spec.secretPath: %w", err)
 	}
 
+	err = mgr.GetFieldIndexer().IndexField(
+		context.TODO(),
+		&secretsv1alpha1.EventDrivenSecret{},
+		"spec.targetSecretName",
+		func(obj client.Object) []string {
+			eds := obj.(*secretsv1alpha1.EventDrivenSecret)
+			if eds.Spec.TargetSecretName == "" {
+				return nil
+			}
+			return []string{eds.Spec.TargetSecretName}
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create index for spec.targetSecretName: %w", err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&secretsv1alpha1.EventDrivenSecret{}).
+		Owns(&corev1.Secret{}).
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				secret, ok := obj.(*corev1.Secret)
+				if !ok {
+					return nil
+				}
+
+				// 🔎 Find matching EventDrivenSecret
+				var matchingEDSList secretsv1alpha1.EventDrivenSecretList
+				err := mgr.GetClient().List(ctx, &matchingEDSList, client.MatchingFields{"spec.targetSecretName": secret.Name})
+				if err != nil {
+					return nil
+				}
+
+				// 📌 Enqueue all related EventDrivenSecrets
+				var requests []reconcile.Request
+				for _, eds := range matchingEDSList.Items {
+					requests = append(requests, reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: eds.Namespace,
+							Name:      eds.Name,
+						},
+					})
+				}
+
+				return requests
+			}),
+		).
 		Named("eventdrivensecret").
 		Complete(r)
 }

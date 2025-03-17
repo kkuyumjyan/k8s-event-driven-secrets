@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -202,4 +203,26 @@ func RolloutDeploymentsSecretUpdate(ctx context.Context, kubeClient client.Clien
 	}
 
 	return nil
+}
+
+func CompareSecretData(currentData map[string][]byte, expectedData map[string][]byte) bool {
+	if len(currentData) != len(expectedData) {
+		return false
+	}
+
+	for key, expectedValue := range expectedData {
+		currentValue, exists := currentData[key]
+		if !exists || !bytes.Equal(currentValue, expectedValue) {
+			return false
+		}
+	}
+	return true
+}
+
+func MaskSecretData(secretData map[string][]byte) map[string]string {
+	maskedData := make(map[string]string)
+	for key := range secretData {
+		maskedData[key] = "********"
+	}
+	return maskedData
 }
