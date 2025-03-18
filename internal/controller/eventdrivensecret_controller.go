@@ -33,21 +33,23 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	providers "github.com/kkuyumjyan/k8s-event-driven-secrets/internal/providers"
-	utils "github.com/kkuyumjyan/k8s-event-driven-secrets/internal/utils"
+	"github.com/kkuyumjyan/k8s-event-driven-secrets/internal/providers"
+	"github.com/kkuyumjyan/k8s-event-driven-secrets/internal/utils"
 
 	secretsv1alpha1 "github.com/kkuyumjyan/k8s-event-driven-secrets/api/v1alpha1"
 )
 
 var (
-	activeListeners = make(map[string]bool)
-	listenersLock   = &sync.Mutex{}
+	listenersLock = &sync.Mutex{}
 )
 
 // EventDrivenSecretReconciler reconciles a EventDrivenSecret object
 type EventDrivenSecretReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme          *runtime.Scheme
+	updatedSecrets  sync.Map
+	activeProviders sync.Map
+	mgr             ctrl.Manager
 }
 
 // +kubebuilder:rbac:groups=secrets.edsm.io,resources=eventdrivensecrets,verbs=get;list;watch;create;update;patch;delete
@@ -67,14 +69,36 @@ type EventDrivenSecretReconciler struct {
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.20.2/pkg/reconcile
 
 func (r *EventDrivenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = log.FromContext(ctx)
+	log := log.FromContext(ctx)
 
-	fmt.Println("Reconciling EventDrivenSecret:", req.NamespacedName)
+	log.Info("🔄 Reconcile triggered", "namespace", req.Namespace, "name", req.Name)
 
-	// Fetch the EventDrivenSecret resource.
+	// Fetch the EventDrivenSecret resource
 	var eventDrivenSecret secretsv1alpha1.EventDrivenSecret
 	if err := r.Get(ctx, req.NamespacedName, &eventDrivenSecret); err != nil {
-		fmt.Println("Failed to get EventDrivenSecret:", err)
+		if errors.IsNotFound(err) {
+			log.Info("🗑 EventDrivenSecret deleted, cleaning up target Secret", "name", req.Name)
+
+			// If the EventDrivenSecret is deleted, delete the target Secret
+			targetSecret := &corev1.Secret{}
+			err := r.Get(ctx, types.NamespacedName{
+				Namespace: req.Namespace,
+				Name:      eventDrivenSecret.Spec.TargetSecretName,
+			}, targetSecret)
+
+			if err == nil {
+				log.Info("🗑 Deleting target Secret", "name", targetSecret.Name)
+				if err := r.Delete(ctx, targetSecret); err != nil {
+					log.Error(err, "❌ Failed to delete target Secret", "name", eventDrivenSecret.Spec.TargetSecretName)
+					return ctrl.Result{}, err
+				}
+			} else if !errors.IsNotFound(err) {
+				log.Error(err, "Failed to get target Secret before deletion", "name", eventDrivenSecret.Spec.TargetSecretName)
+			}
+
+			return ctrl.Result{}, nil
+		}
+		log.Error(err, "❌ Failed to get EventDrivenSecret", "name", req.Name)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -84,38 +108,26 @@ func (r *EventDrivenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	secretPath := eventDrivenSecret.Spec.SecretPath
 	targetSecretName := eventDrivenSecret.Spec.TargetSecretName
 
-	fmt.Printf("Detected EventDrivenSecret: CloudProvider=%s, Region=%s, SecretPath=%s. KubernetesSecretName=%s\n", cloudProvider, region, secretPath, targetSecretName)
+	log.Info("🔎 Detected EventDrivenSecret", "cloudProvider", cloudProvider, "region", region, "secretPath", secretPath, "targetSecretName", targetSecretName)
 
-	// ✅ Ensure only ONE listener per provider
-	listenersLock.Lock()
-	if _, exists := activeListeners[cloudProvider]; !exists {
-		activeListeners[cloudProvider] = true // Mark as running
-		listenersLock.Unlock()
+	// ✅ If a new provider appears, start its listener dynamically instead of restarting `SetupWithManager`
+	if _, exists := r.activeProviders.Load(cloudProvider); !exists {
+		log.Info("🆕 New provider detected, starting listener!", "provider", cloudProvider)
 
-		// Start the listener in a separate Goroutine
-		go func(provider string) {
-			fmt.Printf("🚀 Starting listener for provider: %s\n", provider)
+		// Mark provider as running
+		r.activeProviders.Store(cloudProvider, true)
 
-			err := providers.StartListening(context.Background(), provider, r.Client)
-			if err != nil {
-				fmt.Printf("❌ Listener for provider %s crashed: %v\n", provider, err)
-			}
-
-			// 🔄 If the listener exits (unexpectedly), remove it from the active list to allow restart
-			listenersLock.Lock()
-			delete(activeListeners, provider)
-			listenersLock.Unlock()
-
-		}(cloudProvider)
-
-	} else {
-		listenersLock.Unlock()
+		// Start provider listener in a separate goroutine
+		go func() {
+			providers.StartListening(ctx, cloudProvider, r.Client, &r.updatedSecrets)
+			log.Info("✅ Listener started for provider", "provider", cloudProvider)
+		}()
 	}
 
 	// Fetch secret from AWS Secrets Manager
-	secretValue, err := providers.FetchSecretData(region, secretPath, cloudProvider)
+	secretValue, err := providers.FetchSecretData(ctx, region, secretPath, cloudProvider)
 	if err != nil {
-		fmt.Println("Failed to get secret value:", err)
+		log.Error(err, "❌ Failed to get secret value from provider", "provider", cloudProvider)
 		return ctrl.Result{}, err
 	}
 
@@ -124,51 +136,59 @@ func (r *EventDrivenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	err = r.Client.Get(ctx, client.ObjectKey{Namespace: req.Namespace, Name: targetSecretName}, &targetSecret)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			// Secret does not exist -> Recreate it from AWS/GCP
-			fmt.Println("🔍 Target secret is missing, recreating...")
+			log.Info("🔍 Target secret is missing, recreating", "name", targetSecretName)
 		} else {
-			// Other errors
+			log.Error(err, "❌ Failed to get existing target Secret", "name", targetSecretName)
 			return ctrl.Result{}, err
+		}
+	}
+
+	// 🛑 Check if the secret was just updated by this controller
+	if val, exists := r.updatedSecrets.Load(targetSecretName); exists {
+		log.Info("🔍 Checking self-triggered update",
+			"secret", targetSecretName,
+			"storedResourceVersion", val,
+			"currentResourceVersion", targetSecret.ResourceVersion)
+
+		if resourceVersion, ok := val.(string); ok && resourceVersion == targetSecret.ResourceVersion {
+			log.Info("🚫 Ignoring self-triggered update", "secret", targetSecretName)
+			return ctrl.Result{}, nil
 		}
 	}
 
 	// ✅ Compare current secret with expected secret
 	if !utils.CompareSecretData(targetSecret.Data, secretValue) {
-		fmt.Println("⚠️ Secret modified manually! Restoring original version...")
+		log.Info("⚠️ Secret modified manually! Restoring original version...", "name", targetSecretName)
 
 		// Restore the correct secret
-		err := utils.CreateOrUpdateK8sSecret(ctx, r.Client, req.Namespace, targetSecretName, secretValue)
+		err := utils.CreateOrUpdateK8sSecret(ctx, r.Client, req.Namespace, targetSecretName, secretValue, &r.updatedSecrets)
 		if err != nil {
-			fmt.Println("❌ Failed to restore Kubernetes secret:", err)
+			log.Error(err, "❌ Failed to restore Kubernetes secret", "name", targetSecretName)
 			return ctrl.Result{}, err
 		}
 	} else {
-		fmt.Println("✅ Secret is up-to-date, no changes needed.")
+		log.Info("✅ Secret is up-to-date, no changes needed", "name", targetSecretName)
 	}
 
 	// Rollout the Deployments that reference the secret
 	err = utils.RolloutDeploymentsSecretUpdate(ctx, r.Client, targetSecretName, req.NamespacedName.Namespace)
 	if err != nil {
-		fmt.Println("Failed to rollout deployments:", err)
+		log.Error(err, "❌ Failed to rollout deployments", "secretName", targetSecretName)
 		return ctrl.Result{}, err
 	}
 
-	fmt.Printf("Secret value: %s\n", utils.MaskSecretData(secretValue))
-
-	// Log what we received.
-	fmt.Printf("Detected EventDrivenSecret: CloudProvider=%s, Region=%s, SecretPath=%s\n",
-		eventDrivenSecret.Spec.CloudProvider, eventDrivenSecret.Spec.Region, eventDrivenSecret.Spec.SecretPath)
+	// Mask secrets before logging
+	log.Info("🔐 Secret processed successfully", "name", targetSecretName, "maskedValue", utils.MaskSecretData(secretValue))
 
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
-func (r *EventDrivenSecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	var err error
-	err = mgr.GetFieldIndexer().IndexField(
-		context.TODO(),
-		&appsv1.Deployment{},
-		"metadata.annotations.eventsecrets",
+// ✅ Move Index Creation to a Separate Function
+func (r *EventDrivenSecretReconciler) createFieldIndexes(mgr ctrl.Manager, ctx context.Context) error {
+	log := ctrl.Log.WithName("IndexSetup")
+
+	// Index for Deployment annotations
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &appsv1.Deployment{}, "metadata.annotations.eventsecrets",
 		func(obj client.Object) []string {
 			deployment := obj.(*appsv1.Deployment)
 			secretsAnnotation, exists := deployment.Annotations["eventsecrets"]
@@ -177,21 +197,17 @@ func (r *EventDrivenSecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}
 
 			var secretList []string
-			err := json.Unmarshal([]byte(secretsAnnotation), &secretList)
-			if err != nil {
+			if err := json.Unmarshal([]byte(secretsAnnotation), &secretList); err != nil {
 				return nil
 			}
 			return secretList
 		},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create index for metadata.annotations.eventsecrets: %w", err)
+	); err != nil {
+		return fmt.Errorf("❌ Failed to create index for metadata.annotations.eventsecrets: %w", err)
 	}
 
-	err = mgr.GetFieldIndexer().IndexField(
-		context.TODO(),
-		&secretsv1alpha1.EventDrivenSecret{},
-		"spec.secretPath",
+	// Index for `spec.secretPath`
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &secretsv1alpha1.EventDrivenSecret{}, "spec.secretPath",
 		func(obj client.Object) []string {
 			secret := obj.(*secretsv1alpha1.EventDrivenSecret)
 			if secret.Spec.SecretPath == "" {
@@ -199,15 +215,12 @@ func (r *EventDrivenSecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}
 			return []string{secret.Spec.SecretPath}
 		},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create index for spec.secretPath: %w", err)
+	); err != nil {
+		return fmt.Errorf("❌ Failed to create index for spec.secretPath: %w", err)
 	}
 
-	err = mgr.GetFieldIndexer().IndexField(
-		context.TODO(),
-		&secretsv1alpha1.EventDrivenSecret{},
-		"spec.targetSecretName",
+	// Index for `spec.targetSecretName`
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &secretsv1alpha1.EventDrivenSecret{}, "spec.targetSecretName",
 		func(obj client.Object) []string {
 			eds := obj.(*secretsv1alpha1.EventDrivenSecret)
 			if eds.Spec.TargetSecretName == "" {
@@ -215,10 +228,59 @@ func (r *EventDrivenSecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}
 			return []string{eds.Spec.TargetSecretName}
 		},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create index for spec.targetSecretName: %w", err)
+	); err != nil {
+		return fmt.Errorf("❌ Failed to create index for spec.targetSecretName: %w", err)
 	}
+
+	log.Info("✅ Indexing completed successfully")
+	return nil
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *EventDrivenSecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
+
+	log := ctrl.Log.WithName("SetupWithManager")
+
+	// ✅ Store manager instance in struct for later use
+	r.mgr = mgr
+
+	// ✅ Use Background Context
+	ctx := context.Background()
+
+	// 🔄 Step 1: Create necessary field indexes FIRST!
+	if err := r.createFieldIndexes(mgr, ctx); err != nil {
+		log.Error(err, "❌ Failed to create indexes")
+		return err
+	}
+
+	// ✅ Step 2: Wait for cache to sync before listing resources
+	go func() {
+		<-mgr.Elected()                      // Ensures leader election (if enabled)
+		mgr.GetCache().WaitForCacheSync(ctx) // Waits for cache sync
+
+		log.Info("✅ Cache synced. Fetching existing EventDrivenSecrets...")
+
+		var eventDrivenSecrets secretsv1alpha1.EventDrivenSecretList
+		if err := mgr.GetClient().List(ctx, &eventDrivenSecrets); err != nil {
+			log.Error(err, "❌ Failed to list existing EventDrivenSecrets after cache sync")
+			return
+		}
+
+		for _, eds := range eventDrivenSecrets.Items {
+			cloudProvider := eds.Spec.CloudProvider
+
+			// **Check if listener is already running before starting**
+			if _, exists := r.activeProviders.Load(cloudProvider); !exists {
+				log.Info("🔄 Starting listener for provider", "provider", cloudProvider)
+				r.activeProviders.Store(cloudProvider, true)
+
+				go func() {
+					providers.StartListening(ctx, cloudProvider, mgr.GetClient(), &r.updatedSecrets)
+					log.Info("✅ Listener started for provider", "provider", cloudProvider)
+				}()
+			}
+		}
+	}()
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&secretsv1alpha1.EventDrivenSecret{}).
@@ -229,6 +291,14 @@ func (r *EventDrivenSecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				secret, ok := obj.(*corev1.Secret)
 				if !ok {
 					return nil
+				}
+
+				// Retrieve last known resourceVersion
+				if lastVersion, exists := r.updatedSecrets.Load(secret.Name); exists {
+					if lastVersion == secret.ResourceVersion {
+						ctrl.Log.Info("🔄 Skipping self-triggered reconciliation", "secret", secret.Name, "resourceVersion", secret.ResourceVersion)
+						return nil
+					}
 				}
 
 				// 🔎 Find matching EventDrivenSecret

@@ -1,7 +1,8 @@
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ubuntu-test
+  name: ubuntu-test-1
   namespace: default
   annotations:
     eventsecrets: '["my-secret-1", "my-secret-2"]'  # Annotation for rollout tracking
@@ -19,14 +20,25 @@ spec:
         - name: ubuntu
           image: ubuntu:latest
           command: ["/bin/sh", "-c", "sleep 100000"]
-          env:
-            - name: SECRET_1
-              valueFrom:
-                secretKeyRef:
-                  name: my-secret-1
-                  key: password
-            - name: SECRET_2
-              valueFrom:
-                secretKeyRef:
-                  name: my-secret-2
-                  key: token
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ubuntu-test-2
+  namespace: default
+  annotations:
+    eventsecrets: '["db-credentials", "my-secret-2"]'  # Annotation for rollout tracking
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ubuntu-test
+  template:
+    metadata:
+      labels:
+        app: ubuntu-test
+    spec:
+      containers:
+        - name: ubuntu
+          image: ubuntu:latest
+          command: ["/bin/sh", "-c", "sleep 100000"]

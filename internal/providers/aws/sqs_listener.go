@@ -4,7 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -16,10 +17,13 @@ import (
 	utils "github.com/kkuyumjyan/k8s-event-driven-secrets/internal/utils"
 )
 
+var log = ctrl.Log.WithName("sqs")
+
 // SQSListener listens for messages from AWS SQS and triggers reconciliations
 type SQSListener struct {
 	client.Client
-	QueueURL string
+	QueueURL          string
+	SQSUpdatedSecrets *sync.Map
 }
 
 // SQSMessage represents the event structure from AWS SecretsManager
@@ -34,12 +38,14 @@ type SQSMessage struct {
 }
 
 func (s *SQSListener) handleSQSEvent(ctx context.Context, msg string) {
-	fmt.Println("Received SQS Event:", msg)
+	log := log.WithName("SQSListener.handleSQSEvent")
+
+	log.Info("📩 Received SQS Event")
 
 	// Parse the JSON message
 	var event SQSMessage
 	if err := json.Unmarshal([]byte(msg), &event); err != nil {
-		log.Printf("Error: Failed to parse SQS message: %v", err)
+		log.Error(err, "❌ Failed to parse SQS message")
 		return
 	}
 
@@ -48,68 +54,67 @@ func (s *SQSListener) handleSQSEvent(ctx context.Context, msg string) {
 	fullSecretID := event.Detail.RequestParameters.SecretId // The ARN of secret returns here from AWS Event
 
 	if fullSecretID == "" || region == "" {
-		log.Println("Missing secretId or region, skipping...")
+		log.Info("⚠️ Missing secretId or region, skipping...")
 		return
 	}
 
 	provider := &AWSSecretManagerProvider{}
 
 	// ✅ Fetch the user-visible name instead of stripping
-	secretPath, err := provider.FetchSecretName(region, fullSecretID)
+	secretPath, err := provider.FetchSecretName(ctx, region, fullSecretID)
 	if err != nil {
-		log.Printf("Failed to fetch secret name: %v", err)
+		log.Error(err, "❌ Failed to fetch secret name", "fullSecretID", fullSecretID, "region", region)
 		return
 	}
 
-	fmt.Printf("🔄 Secret updated: %s (real name: %s)\n", fullSecretID, secretPath)
+	log.Info("🔄 Secret update detected", "AWSSecretID", fullSecretID, "SecretPath", secretPath)
 
 	// Fetch the updated secret value
-	secretValue, err := provider.FetchSecretData(region, secretPath)
+	secretValue, err := provider.FetchSecretData(ctx, region, secretPath)
 	if err != nil {
-		log.Printf("Failed to fetch updated secret: %v", err)
+		log.Error(err, "❌ Failed to fetch updated secret", "SecretPath", secretPath, "region", region)
 		return
 	}
 
-	fmt.Printf("✅ Successfully fetched updated secret (%s): %s\n", fullSecretID, secretValue)
+	// ✅ Mask the secret before logging to prevent leaks
+	maskedSecret := utils.MaskSecretData(secretValue)
+	log.Info("✅ Successfully fetched updated secret", "AWSSecretID", fullSecretID, "MaskedSecret", maskedSecret)
 
 	// Find all matching EventDrivenSecret resources in Kubernetes
 	eventDrivenSecrets, err := s.findMatchingEventDrivenSecrets(ctx, secretPath)
 	if err != nil {
-		log.Printf("❌ Error finding EventDrivenSecret resources: %v", err)
+		log.Error(err, "❌ Error finding EventDrivenSecret resources")
 		return
 	}
 
 	if len(eventDrivenSecrets) == 0 {
-		log.Println("⚠️ No matching EventDrivenSecret resources found. Skipping update.")
-		return
+		log.Info("❌ Error finding matching EventDrivenSecret resources", "SecretPath", secretPath)
 	}
 
-	// Loop through all matching EventDrivenSecrets and update their corresponding Kubernetes Secrets
+	// ✅ Update the EventDrivenSecret to trigger reconciliation
 	for _, eds := range eventDrivenSecrets {
-		err := utils.CreateOrUpdateK8sSecret(ctx, s.Client, eds.Namespace, eds.Spec.TargetSecretName, secretValue)
-		if err != nil {
-			log.Printf("❌ Failed to update Kubernetes Secret for EventDrivenSecret %s: %v", eds.Name, err)
-		} else {
-			fmt.Printf("✅ Kubernetes Secret '%s' updated successfully\n", eds.Spec.TargetSecretName)
-		}
-	}
+		log.Info("✏️ Updating EventDrivenSecret to trigger reconcile", "EventDrivenSecret", eds.Name)
 
-	// Rollout the Deployments that reference the secret
-	err = utils.RolloutDeploymentsSecretUpdate(ctx, s.Client, eventDrivenSecrets[0].Spec.TargetSecretName, eventDrivenSecrets[0].Namespace)
-	if err != nil {
-		fmt.Println("Failed to rollout deployments:", err)
-		return
+		eds.Annotations["edsm.io/last-updated"] = time.Now().Format(time.RFC3339) // ✅ Trigger reconcile
+
+		if err := s.Client.Update(ctx, &eds); err != nil {
+			log.Error(err, "❌ Failed to update EventDrivenSecret", "EventDrivenSecret", eds.Name)
+		} else {
+			log.Info("✅ EventDrivenSecret updated successfully", "EventDrivenSecret", eds.Name)
+		}
 	}
 }
 
 // Find EventDrivenSecrets that reference the given AWS Secret ARN
 func (s *SQSListener) findMatchingEventDrivenSecrets(ctx context.Context, secretPath string) ([]secretsv1alpha1.EventDrivenSecret, error) {
+	log := log.WithName("SQSListener.findMatchingEventDrivenSecrets")
+
 	var eventDrivenSecretList secretsv1alpha1.EventDrivenSecretList
 	err := s.List(ctx, &eventDrivenSecretList, client.MatchingFields{
 		"spec.secretPath": secretPath,
 	})
 	if err != nil {
-		log.Printf("failed to list EventDrivenSecrets: %v", err)
+		log.Error(err, "Failed to list EventDrivenSecrets")
 		return nil, err
 	}
 
@@ -118,15 +123,19 @@ func (s *SQSListener) findMatchingEventDrivenSecrets(ctx context.Context, secret
 
 // StartListening continuously polls AWS SQS for secret update events
 func (s *SQSListener) StartListening(ctx context.Context, queueURL string) {
+	log := log.WithName("SQSListener.StartListening")
+
 	// Read SQS Queue URL from ENV variable
 	if queueURL == "" {
-		log.Fatal("SQS_QUEUE_URL environment variable is not set")
+		log.Error(fmt.Errorf("SQS_QUEUE_URL is empty"), "❌ Missing SQS queue URL")
+		return
 	}
 	s.QueueURL = queueURL
 
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
-		log.Fatalf("Failed to load AWS config: %v", err)
+		log.Error(err, "❌ Failed to load AWS config")
+		return
 	}
 
 	sqsClient := sqs.NewFromConfig(cfg)
@@ -140,7 +149,7 @@ func (s *SQSListener) StartListening(ctx context.Context, queueURL string) {
 		})
 
 		if err != nil {
-			log.Printf("Error receiving SQS messages: %v", err)
+			log.Error(err, "Error receiving SQS messages")
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -149,7 +158,7 @@ func (s *SQSListener) StartListening(ctx context.Context, queueURL string) {
 			fmt.Println("Received SQS event:", *message.Body)
 
 			// Process the message
-			s.handleSQSEvent(context.TODO(), *message.Body)
+			s.handleSQSEvent(ctx, *message.Body)
 
 			// Delete message after processing
 			_, err := sqsClient.DeleteMessage(ctx, &sqs.DeleteMessageInput{
@@ -157,7 +166,8 @@ func (s *SQSListener) StartListening(ctx context.Context, queueURL string) {
 				ReceiptHandle: message.ReceiptHandle,
 			})
 			if err != nil {
-				log.Printf("Failed to delete processed SQS message: %v", err)
+				log.Error(err, "❌ Failed to delete processed SQS message")
+				return
 			}
 		}
 	}

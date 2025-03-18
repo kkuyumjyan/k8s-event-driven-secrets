@@ -7,19 +7,23 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"sort"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+var utilsLog = ctrl.Log.WithName("utils")
+
 // ✅ Ensure a Kubernetes Secret exists and is up to date
-func CreateOrUpdateK8sSecret(ctx context.Context, k8sClient client.Client, namespace, secretName string, secretData map[string][]byte) error {
+func CreateOrUpdateK8sSecret(ctx context.Context, k8sClient client.Client, namespace, secretName string, secretData map[string][]byte, updatedSecrets *sync.Map) error {
+	log := ctrl.Log.WithName("utils.CreateOrUpdateK8sSecret")
 	// Define a retry loop in case of conflicts
 	var existingSecret corev1.Secret
 	secretKey := client.ObjectKey{Name: secretName, Namespace: namespace}
@@ -36,19 +40,20 @@ func CreateOrUpdateK8sSecret(ctx context.Context, k8sClient client.Client, names
 
 			err = k8sClient.Update(ctx, &existingSecret)
 			if err == nil {
-				fmt.Printf("🔄 Updated existing Kubernetes Secret: %s\n", secretName)
+				log.Info("🔄 Updated existing Kubernetes Secret", "secretname", secretName)
 				return nil
 			}
 
 			// 🛑 Conflict detected, retry with the latest version
 			if apierrors.IsConflict(err) {
-				fmt.Printf("⚠️ Conflict updating secret '%s', retrying...\n", secretName)
+				log.Info("⚠️ Conflict updating secret, retrying...", secretName)
 				time.Sleep(200 * time.Millisecond) // Short wait before retrying
 				continue
 			}
 
 			// If error is not a conflict, return
-			return fmt.Errorf("❌ Failed to update existing Kubernetes Secret: %w", err)
+			log.Error(err, "❌ Failed to update existing Kubernetes Secret")
+			return err
 		}
 
 		// If secret does not exist, create it
@@ -65,10 +70,11 @@ func CreateOrUpdateK8sSecret(ctx context.Context, k8sClient client.Client, names
 		}
 
 		if err := k8sClient.Create(ctx, newSecret); err != nil {
-			return fmt.Errorf("❌ Failed to create new Kubernetes Secret: %w", err)
+			log.Error(err, "❌ Failed to create new Kubernetes Secret")
+			return err
 		}
 
-		fmt.Printf("✅ Created new Kubernetes Secret: %s\n", secretName)
+		log.Info("✅ Created new Kubernetes Secret", "secretname", secretName)
 		return nil
 	}
 
@@ -77,30 +83,61 @@ func CreateOrUpdateK8sSecret(ctx context.Context, k8sClient client.Client, names
 
 // ✅ Compute SHA256 checksums of all secret values
 func ComputeSecretChecksums(ctx context.Context, kubeClient client.Client, namespace string, secretNames []string) (map[string]string, error) {
+	log := ctrl.Log.WithName("utils.ComputeSecretChecksums")
+
 	checksums := make(map[string]string)
 
 	for _, secretName := range secretNames {
 		secret := &corev1.Secret{}
 		err := kubeClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, secret)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get secret %s: %w", secretName, err)
+			log.Error(err, "failed to get secret", "secretName", secretName)
+			return nil, err
 		}
+
+		// 🛑 Debugging: Log fetched secret data
+		log.Info("🔍 Fetched Kubernetes Secret", "secretName", secretName)
 
 		// ✅ Normalize the secret data into a consistent format before hashing
 		checksum := calculateSHA256(secret.Data)
 		checksums[secretName] = checksum
+
+		// 🛑 Debugging: Log calculated hash
+		log.Info("🔍 Calculated Secret Hash", "secretName", secretName, "hash", checksum)
 	}
 
 	return checksums, nil
 }
 
 // ✅ Compare stored vs. new checksums
+// ✅ Compare stored vs. new checksums with detailed logging
 func IsSecretChanged(storedChecksums, newChecksums map[string]string) bool {
+	log := ctrl.Log.WithName("utils.IsSecretChanged")
+
+	// If storedChecksums is empty, consider it a change (first-time case)
+	if len(storedChecksums) == 0 {
+		log.Info("🔄 Stored checksums are empty, considering secret as changed")
+		return true
+	}
+
 	for key, newHash := range newChecksums {
-		if storedChecksums[key] != newHash {
-			return true // If any secret changed, return true
+		storedHash, exists := storedChecksums[key]
+
+		if !exists {
+			log.Info("🔍 Secret missing in stored checksums, marking as changed",
+				"key", key, "newHash", newHash)
+			return true
+		}
+
+		if storedHash != newHash {
+			log.Info("🔄 Secret checksum changed",
+				"key", key, "storedHash", storedHash, "newHash", newHash)
+			return true
 		}
 	}
+
+	// ✅ No changes detected
+	log.Info("✅ No changes in secret checksums, skipping rollout")
 	return false
 }
 
@@ -129,14 +166,17 @@ func calculateSHA256(secretData map[string][]byte) string {
 
 // ✅ Rollout deployments if secrets have changed
 func RolloutDeploymentsSecretUpdate(ctx context.Context, kubeClient client.Client, updatedSecretName, namespace string) error {
-	fmt.Println("🚀 Calling RolloutDeploymentsSecretUpdate for:", updatedSecretName, "in namespace:", namespace)
+	log := ctrl.Log.WithName("utils.RolloutDeployments")
+
+	log.Info("🚀 Calling RolloutDeploymentsSecretUpdate for deployments using", "secret", updatedSecretName, "namespace", namespace)
 	// Fetch deployments that reference the updated secret using the index
 	var deployments appsv1.DeploymentList
 	err := kubeClient.List(ctx, &deployments, client.MatchingFields{
 		"metadata.annotations.eventsecrets": updatedSecretName,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to list deployments: %w", err)
+		log.Error(err, "failed to list deployments")
+		return err
 	}
 
 	for _, deployment := range deployments.Items {
@@ -150,14 +190,14 @@ func RolloutDeploymentsSecretUpdate(ctx context.Context, kubeClient client.Clien
 		var secretNames []string
 		err := json.Unmarshal([]byte(secretsAnnotation), &secretNames)
 		if err != nil {
-			log.Printf("❌ Failed to parse eventsecrets annotation: %v", err)
+			log.Error(err, "❌ Failed to parse eventsecrets annotation")
 			continue
 		}
 
 		// ✅ Compute new secret checksums for ALL secrets in the annotation
 		newChecksums, err := ComputeSecretChecksums(ctx, kubeClient, deployment.Namespace, secretNames)
 		if err != nil {
-			log.Printf("❌ Failed to compute secret checksums: %v", err)
+			log.Error(err, "❌ Failed to compute secret checksums")
 			continue
 		}
 
@@ -166,14 +206,21 @@ func RolloutDeploymentsSecretUpdate(ctx context.Context, kubeClient client.Clien
 		if checksumAnnotation, exists := deployment.Annotations["eventsecrets-checksum"]; exists {
 			err := json.Unmarshal([]byte(checksumAnnotation), &storedChecksums)
 			if err != nil {
-				log.Printf("⚠️ Skipping deployment %s due to invalid eventsecrets-checksum JSON", deployment.Name)
+				log.Info("⚠️ Skipping deployment due to invalid eventsecrets-checksum JSON",
+					"deployment", deployment.Name,
+					"error", err.Error(),
+				)
 				continue
 			}
 		}
 
 		// ✅ Compare all checksums
 		if !IsSecretChanged(storedChecksums, newChecksums) {
-			log.Printf("✅ No changes in secrets for deployment %s, skipping rollout", deployment.Name)
+			log.Info("✅ No changes in secrets for deployment, skipping rollout",
+				"deployment", deployment.Name,
+				"storedChecksums", storedChecksums,
+				"newChecksums", newChecksums,
+			)
 			continue
 		}
 
@@ -195,11 +242,11 @@ func RolloutDeploymentsSecretUpdate(ctx context.Context, kubeClient client.Clien
 		// ✅ Apply deployment update
 		err = kubeClient.Update(ctx, &deployment)
 		if err != nil {
-			log.Printf("❌ Failed to update deployment %s: %v", deployment.Name, err)
+			log.Error(err, "❌ Failed to update deployment", "deployment", deployment.Name)
 			continue
 		}
 
-		log.Printf("✅ Rollout triggered for deployment %s", deployment.Name)
+		log.Info("✅ Rollout triggered for deployment", "deployment", deployment.Name)
 	}
 
 	return nil
