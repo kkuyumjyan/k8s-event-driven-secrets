@@ -9,3 +9,7 @@ variable "edsm_service_account_name" {
 variable "cluster_name" {
   default = "my-cluster"
 }
+
+variable "edsm_namespace" {
+  default = "kube-system"
+}

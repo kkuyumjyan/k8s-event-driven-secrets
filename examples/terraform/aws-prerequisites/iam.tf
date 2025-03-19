@@ -36,7 +36,7 @@ data "aws_iam_policy_document" "edsm_assume_role_policy" {
       test     = "StringEquals"
       variable = "${replace(data.aws_eks_cluster.this.identity.0.oidc.0.issuer, "https://", "")}:sub"
       values = [
-        "system:serviceaccount:kube-system:${var.edsm_service_account_name}"
+        "system:serviceaccount:${var.edsm_namespace}:${var.edsm_service_account_name}"
       ]
     }
   }

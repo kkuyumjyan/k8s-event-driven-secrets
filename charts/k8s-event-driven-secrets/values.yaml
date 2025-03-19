@@ -5,8 +5,10 @@
 replicaCount: 1
 
 extraEnv:
-  - name: SQS_QUEUE_URL
-    value: "https://sqs.eu-west-3.amazonaws.com/474668414234/secrets-update-queue"
+#  - name: SQS_QUEUE_URL
+#    value: "https://sqs.eu-west-1.amazonaws.com/123456798123/secrets-manager-events-queue"
+#  - name: PUBSUB_QUEUE_URL
+#    value: "https://pubsub.googleapis.com/v1/projects/my-project/topics/my-topic"
 
 extraEnvFrom: []
  # - configMapRef:
@@ -29,7 +31,7 @@ serviceAccount:
   create: true
   # Annotations to add to the service account
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::474668414234:role/movato-staging-edsm-service-account
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789123:role/my-cluster-edsm-service-account
   # The name of the service account to use.
   # If not set and create is true, a name is generated using the fullname template
   name: ""

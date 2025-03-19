@@ -27,3 +27,5 @@ go.work
 *~
 *.tfvars
 .terraform
+*.tfstate
+*.tfstate.backup

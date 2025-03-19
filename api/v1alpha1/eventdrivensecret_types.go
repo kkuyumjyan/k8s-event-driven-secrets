@@ -28,11 +28,10 @@ type EventDrivenSecretSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	CloudProvider    string `json:"cloudProvider"`         // Cloud provider (aws, gcp, azure)
-	Region           string `json:"region"`                // Region where the secret is stored
-	SecretPath       string `json:"secretPath"`            // Path to the secret in the cloud provider
-	TargetSecretName string `json:"targetSecretName"`      // The Kubernetes Secret name to create/update
-	RefreshMode      string `json:"refreshMode,omitempty"` // Mode: "event" or "poll"
+	CloudProvider    string `json:"cloudProvider"`    // Cloud provider (aws, gcp, azure)
+	Region           string `json:"region"`           // Region where the secret is stored
+	SecretPath       string `json:"secretPath"`       // Path to the secret in the cloud provider
+	TargetSecretName string `json:"targetSecretName"` // The Kubernetes Secret name to create/update
 }
 
 // EventDrivenSecretStatus defines the observed state of EventDrivenSecret.
