@@ -28,10 +28,10 @@ type EventDrivenSecretSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	CloudProvider    string `json:"cloudProvider"`    // Cloud provider (aws, gcp, azure)
-	Region           string `json:"region"`           // Region where the secret is stored
-	SecretPath       string `json:"secretPath"`       // Path to the secret in the cloud provider
-	TargetSecretName string `json:"targetSecretName"` // The Kubernetes Secret name to create/update
+	CloudProvider        string               `json:"cloudProvider"`        // Cloud provider (aws, gcp, azure)
+	CloudProviderOptions CloudProviderOptions `json:"cloudProviderOptions"` // Provider-specific settings
+	SecretPath           string               `json:"secretPath"`           // Path to the secret in the cloud provider
+	TargetSecretName     string               `json:"targetSecretName"`     // The Kubernetes Secret name to create/update
 }
 
 // EventDrivenSecretStatus defines the observed state of EventDrivenSecret.
@@ -60,6 +60,12 @@ type EventDrivenSecretList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []EventDrivenSecret `json:"items"`
+}
+
+type CloudProviderOptions struct {
+	Region       string `json:"region,omitempty"`
+	GCPProjectID string `json:"gcpProjectID,omitempty"`
+	// Add more provider-specific fields as needed
 }
 
 func init() {

@@ -61,7 +61,7 @@ func (s *SQSListener) handleSQSEvent(ctx context.Context, msg string) {
 	provider := &AWSSecretManagerProvider{}
 
 	// ✅ Fetch the user-visible name instead of stripping
-	secretPath, err := provider.FetchSecretName(ctx, region, fullSecretID)
+	secretPath, err := provider.fetchSecretName(ctx, region, fullSecretID)
 	if err != nil {
 		log.Error(err, "❌ Failed to fetch secret name", "fullSecretID", fullSecretID, "region", region)
 		return
@@ -70,7 +70,7 @@ func (s *SQSListener) handleSQSEvent(ctx context.Context, msg string) {
 	log.Info("🔄 Secret update detected", "AWSSecretID", fullSecretID, "SecretPath", secretPath)
 
 	// Fetch the updated secret value
-	secretValue, err := provider.FetchSecretData(ctx, region, secretPath)
+	secretValue, err := provider.FetchSecretData(ctx, secretPath)
 	if err != nil {
 		log.Error(err, "❌ Failed to fetch updated secret", "SecretPath", secretPath, "region", region)
 		return
@@ -92,17 +92,7 @@ func (s *SQSListener) handleSQSEvent(ctx context.Context, msg string) {
 	}
 
 	// ✅ Update the EventDrivenSecret to trigger reconciliation
-	for _, eds := range eventDrivenSecrets {
-		log.Info("✏️ Updating EventDrivenSecret to trigger reconcile", "EventDrivenSecret", eds.Name)
-
-		eds.Annotations["edsm.io/last-updated"] = time.Now().Format(time.RFC3339) // ✅ Trigger reconcile
-
-		if err := s.Client.Update(ctx, &eds); err != nil {
-			log.Error(err, "❌ Failed to update EventDrivenSecret", "EventDrivenSecret", eds.Name)
-		} else {
-			log.Info("✅ EventDrivenSecret updated successfully", "EventDrivenSecret", eds.Name)
-		}
-	}
+	utils.AnnotateEventDrivenSecrets(ctx, eventDrivenSecrets, s.Client)
 }
 
 // Find EventDrivenSecrets that reference the given AWS Secret ARN
