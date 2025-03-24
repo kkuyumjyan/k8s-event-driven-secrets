@@ -104,11 +104,11 @@ func (r *EventDrivenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	// Extract values from the resource spec
 	cloudProvider := eventDrivenSecret.Spec.CloudProvider
-	region := eventDrivenSecret.Spec.Region
+	cloudProviderOptions := eventDrivenSecret.Spec.CloudProviderOptions
 	secretPath := eventDrivenSecret.Spec.SecretPath
 	targetSecretName := eventDrivenSecret.Spec.TargetSecretName
 
-	log.Info("🔎 Detected EventDrivenSecret", "cloudProvider", cloudProvider, "region", region, "secretPath", secretPath, "targetSecretName", targetSecretName)
+	log.Info("🔎 Detected EventDrivenSecret", "cloudProvider", cloudProvider, "secretPath", secretPath, "targetSecretName", targetSecretName)
 
 	// ✅ If a new provider appears, start its listener dynamically instead of restarting `SetupWithManager`
 	if _, exists := r.activeProviders.Load(cloudProvider); !exists {
@@ -119,13 +119,18 @@ func (r *EventDrivenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 		// Start provider listener in a separate goroutine
 		go func() {
-			providers.StartListening(ctx, cloudProvider, r.Client, &r.updatedSecrets)
+			provider, _ := providers.NewProvider(cloudProvider, cloudProviderOptions)
+			err := provider.StartListening(ctx, r.Client, &r.updatedSecrets)
+			if err != nil {
+				return // TODO: Handle
+			}
 			log.Info("✅ Listener started for provider", "provider", cloudProvider)
 		}()
 	}
 
 	// Fetch secret from AWS Secrets Manager
-	secretValue, err := providers.FetchSecretData(ctx, region, secretPath, cloudProvider)
+	provider, _ := providers.NewProvider(cloudProvider, cloudProviderOptions)
+	secretValue, err := provider.FetchSecretData(ctx, secretPath)
 	if err != nil {
 		log.Error(err, "❌ Failed to get secret value from provider", "provider", cloudProvider)
 		return ctrl.Result{}, err
@@ -275,7 +280,11 @@ func (r *EventDrivenSecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				r.activeProviders.Store(cloudProvider, true)
 
 				go func() {
-					providers.StartListening(ctx, cloudProvider, mgr.GetClient(), &r.updatedSecrets)
+					provider, _ := providers.NewProvider(cloudProvider, eds.Spec.CloudProviderOptions)
+					err := provider.StartListening(ctx, mgr.GetClient(), &r.updatedSecrets)
+					if err != nil {
+						return
+					}
 					log.Info("✅ Listener started for provider", "provider", cloudProvider)
 				}()
 			}

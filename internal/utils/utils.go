@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/kkuyumjyan/k8s-event-driven-secrets/api/v1alpha1"
 	"sort"
 	"sync"
 	"time"
@@ -272,4 +273,19 @@ func MaskSecretData(secretData map[string][]byte) map[string]string {
 		maskedData[key] = "********"
 	}
 	return maskedData
+}
+
+func AnnotateEventDrivenSecrets(ctx context.Context, eventDrivenSecrets []v1alpha1.EventDrivenSecret, kubeClient client.Client) {
+	log := ctrl.Log.WithName("utils.AnnotateEventDrivenSecrets")
+	for _, eds := range eventDrivenSecrets {
+		log.Info("✏️ Updating EventDrivenSecret to trigger reconcile", "EventDrivenSecret", eds.Name)
+
+		eds.Annotations["edsm.io/last-updated"] = time.Now().Format(time.RFC3339) // ✅ Trigger reconcile
+
+		if err := kubeClient.Update(ctx, &eds); err != nil {
+			log.Error(err, "❌ Failed to update EventDrivenSecret", "EventDrivenSecret", eds.Name)
+		} else {
+			log.Info("✅ EventDrivenSecret updated successfully", "EventDrivenSecret", eds.Name)
+		}
+	}
 }

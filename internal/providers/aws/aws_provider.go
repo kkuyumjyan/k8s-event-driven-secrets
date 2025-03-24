@@ -3,11 +3,13 @@ package aws
 import (
 	"context"
 	"encoding/json"
-	ctrl "sigs.k8s.io/controller-runtime"
-
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"os"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sync"
 )
 
 // Ensure AWSSecretManagerProvider implements Provider
@@ -15,13 +17,23 @@ type AWSSecretManagerProvider struct {
 	Region string
 }
 
+func (p *AWSSecretManagerProvider) StartListening(ctx context.Context, k8sClient client.Client, updatedSecrets *sync.Map) error {
+	queueURL := os.Getenv("SQS_QUEUE_URL")
+	listener := SQSListener{
+		Client:   k8sClient, // Pass Kubernetes client
+		QueueURL: queueURL,
+	}
+	go listener.StartListening(ctx, queueURL) // Run in Goroutine
+	return nil
+}
+
 var awslogs = ctrl.Log.WithName("aws")
 
 // ✅ Fetch a secret's value from AWS Secrets Manager
-func (p *AWSSecretManagerProvider) FetchSecretData(ctx context.Context, region, secretPath string) (map[string][]byte, error) {
+func (p *AWSSecretManagerProvider) FetchSecretData(ctx context.Context, secretPath string) (map[string][]byte, error) {
 	log := ctrl.Log.WithName("awslogs.FetchSecretData")
 
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(p.Region))
 	if err != nil {
 		log.Error(err, "Unable to load AWS SDK config")
 		return nil, err
@@ -52,7 +64,7 @@ func (p *AWSSecretManagerProvider) FetchSecretData(ctx context.Context, region, 
 }
 
 // ✅ Fetch the real user-visible name of an AWS Secret
-func (p *AWSSecretManagerProvider) FetchSecretName(ctx context.Context, region, secretARN string) (string, error) {
+func (p *AWSSecretManagerProvider) fetchSecretName(ctx context.Context, region, secretARN string) (string, error) {
 	log := ctrl.Log.WithName("awslogs.FetchSecretData")
 
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
