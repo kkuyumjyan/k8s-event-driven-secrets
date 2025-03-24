@@ -24,6 +24,6 @@ func (p *GCPSecretsProvider) FetchSecretData(ctx context.Context, secretPath str
 	log := ctrl.Log.WithName("gcp.FetchSecretData")
 
 	// Fetch the secret from GCP Secret Manager
-	log.Info("Fetching secret from GCP Secret Manager", "region", "secretPath", secretPath)
+	log.Info("Fetching secret from GCP Secret Manager", "secretPath", secretPath)
 	return nil, nil
 }

@@ -118,7 +118,7 @@ spec:
   cloudProviderOptions:
     region: eu-west-3           # Cloud Provider Region where the secret exists
   secretPath: staging/common-secrets # Path to the cloud secret
-  targetSecretName: backend-secrets # The name of the Kubernetes Secret to create/update
+  targetSecretName: my-secret-1 # The name of the Kubernetes Secret to create/update
 ```
 ### ✅ How it Works:
 - When staging/common-secrets is updated in AWS Secrets Manager, **EDSM automatically updates** my-secret-1 in Kubernetes.
