@@ -119,11 +119,17 @@ func (r *EventDrivenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 		// Start provider listener in a separate goroutine
 		go func() {
-			provider, _ := providers.NewProvider(cloudProvider, cloudProviderOptions)
-			err := provider.StartListening(ctx, r.Client, &r.updatedSecrets)
+			provider, err := providers.NewProvider(cloudProvider, cloudProviderOptions)
 			if err != nil {
-				return // TODO: Handle
+				log.Error(err, "❌ Failed to initialize provider", "provider", cloudProvider, "options", cloudProviderOptions)
+				return
 			}
+
+			if err := provider.StartListening(ctx, r.Client, &r.updatedSecrets); err != nil {
+				log.Error(err, "❌ Failed to start listener for provider", "provider", cloudProvider)
+				return
+			}
+
 			log.Info("✅ Listener started for provider", "provider", cloudProvider)
 		}()
 	}
