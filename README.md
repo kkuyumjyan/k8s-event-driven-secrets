@@ -115,7 +115,8 @@ metadata:
   namespace: default
 spec:
   cloudProvider: aws          # Cloud provider (aws, GCP/Azure planned)
-  region: eu-west-3           # Cloud Provider Region where the secret exists
+  cloudProviderOptions:
+    region: eu-west-3           # Cloud Provider Region where the secret exists
   secretPath: staging/common-secrets # Path to the cloud secret
   targetSecretName: backend-secrets # The name of the Kubernetes Secret to create/update
 ```
