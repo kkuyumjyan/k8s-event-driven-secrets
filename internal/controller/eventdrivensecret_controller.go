@@ -20,12 +20,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/kkuyumjyan/k8s-event-driven-secrets/internal/metrics"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,10 +42,6 @@ import (
 	"github.com/kkuyumjyan/k8s-event-driven-secrets/internal/utils"
 
 	secretsv1alpha1 "github.com/kkuyumjyan/k8s-event-driven-secrets/api/v1alpha1"
-)
-
-var (
-	listenersLock = &sync.Mutex{}
 )
 
 // EventDrivenSecretReconciler reconciles a EventDrivenSecret object
@@ -125,7 +126,7 @@ func (r *EventDrivenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Re
 				return
 			}
 
-			if err := provider.StartListening(ctx, r.Client, &r.updatedSecrets); err != nil {
+			if err := provider.StartListening(ctx, r.Client); err != nil {
 				log.Error(err, "❌ Failed to start listener for provider", "provider", cloudProvider)
 				return
 			}
@@ -140,6 +141,8 @@ func (r *EventDrivenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if err != nil {
 		log.Error(err, "❌ Failed to get secret value from provider", "provider", cloudProvider)
 		return ctrl.Result{}, err
+	} else {
+		metrics.SecretsFetched.WithLabelValues(secretPath, req.Namespace).Inc()
 	}
 
 	// ✅ Fetch the existing Kubernetes Secret
@@ -148,6 +151,7 @@ func (r *EventDrivenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if err != nil {
 		if errors.IsNotFound(err) {
 			log.Info("🔍 Target secret is missing, recreating", "name", targetSecretName)
+			metrics.SecretsProvisionedTotal.WithLabelValues(targetSecretName, req.Namespace).Inc()
 		} else {
 			log.Error(err, "❌ Failed to get existing target Secret", "name", targetSecretName)
 			return ctrl.Result{}, err
@@ -169,22 +173,36 @@ func (r *EventDrivenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	// ✅ Compare current secret with expected secret
 	if !utils.CompareSecretData(targetSecret.Data, secretValue) {
-		log.Info("⚠️ Secret modified manually! Restoring original version...", "name", targetSecretName)
-
-		// Restore the correct secret
 		err := utils.CreateOrUpdateK8sSecret(ctx, r.Client, req.Namespace, targetSecretName, secretValue, &r.updatedSecrets)
 		if err != nil {
 			log.Error(err, "❌ Failed to restore Kubernetes secret", "name", targetSecretName)
 			return ctrl.Result{}, err
+		} else {
+			metrics.SecretsUpdatedTotal.WithLabelValues(targetSecretName, req.Namespace).Inc()
 		}
 	} else {
 		log.Info("✅ Secret is up-to-date, no changes needed", "name", targetSecretName)
+		return ctrl.Result{}, nil
 	}
 
 	// Rollout the Deployments that reference the secret
 	err = utils.RolloutDeploymentsSecretUpdate(ctx, r.Client, targetSecretName, req.NamespacedName.Namespace)
 	if err != nil {
 		log.Error(err, "❌ Failed to rollout deployments", "secretName", targetSecretName)
+		return ctrl.Result{}, err
+	} else {
+		metrics.DeploymentsRolledOut.WithLabelValues(targetSecretName, req.Namespace).Inc()
+	}
+
+	utils.SetReadyCondition(&eventDrivenSecret, metav1.ConditionTrue, "SecretSynced", "Secret synced successfully")
+	eventDrivenSecret.Status.ObservedGeneration = eventDrivenSecret.Generation
+	eventDrivenSecret.Status.LastSyncedTime = &metav1.Time{Time: time.Now()}
+	eventDrivenSecret.Status.Message = "Secret is up to date"
+	eventDrivenSecret.Status.Reason = "SyncSuccess"
+	eventDrivenSecret.Status.LastAppliedSecretHash = utils.CalculateSHA256(secretValue)
+
+	if err := r.Status().Update(ctx, &eventDrivenSecret); err != nil {
+		log.Error(err, "❌ Failed to update status")
 		return ctrl.Result{}, err
 	}
 
@@ -279,6 +297,16 @@ func (r *EventDrivenSecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 		for _, eds := range eventDrivenSecrets.Items {
 			cloudProvider := eds.Spec.CloudProvider
+			metrics.TotalEventDrivenSecrets.WithLabelValues(eds.Namespace).Inc()
+
+			var deployments appsv1.DeploymentList
+			err := r.List(ctx, &deployments, client.MatchingFields{
+				"metadata.annotations.eventsecrets": eds.Spec.TargetSecretName,
+			})
+			if err == nil {
+				metrics.DeploymentsUsingSecrets.WithLabelValues(eds.Spec.TargetSecretName, eds.Namespace).
+					Set(float64(len(deployments.Items)))
+			}
 
 			// **Check if listener is already running before starting**
 			if _, exists := r.activeProviders.Load(cloudProvider); !exists {
@@ -287,7 +315,7 @@ func (r *EventDrivenSecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 				go func() {
 					provider, _ := providers.NewProvider(cloudProvider, eds.Spec.CloudProviderOptions)
-					err := provider.StartListening(ctx, mgr.GetClient(), &r.updatedSecrets)
+					err := provider.StartListening(ctx, mgr.GetClient())
 					if err != nil {
 						return
 					}
@@ -295,6 +323,7 @@ func (r *EventDrivenSecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}()
 			}
 		}
+
 	}()
 
 	return ctrl.NewControllerManagedBy(mgr).

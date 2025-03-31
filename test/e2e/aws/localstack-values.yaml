@@ -1,0 +1,9 @@
+extraEnv:
+  - name: SERVICES
+    value: secretsmanager,sqs
+  - name: DEBUG
+    value: "1"
+service:
+  type: NodePort
+  nodePorts:
+     edge: 31566

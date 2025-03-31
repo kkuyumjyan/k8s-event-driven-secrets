@@ -39,6 +39,21 @@ type EventDrivenSecretStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 	LastAppliedSecretHash string `json:"lastAppliedSecretHash,omitempty"`
+
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// +optional
+	LastSyncedTime *metav1.Time `json:"lastSyncedTime,omitempty"`
+
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// +optional
+	Reason string `json:"reason,omitempty"`
 }
 
 // +kubebuilder:object:root=true

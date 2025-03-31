@@ -1,0 +1,25 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: localstack-bootstrap
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+        - name: aws-cli
+          image: amazon/aws-cli
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: test
+            - name: AWS_SECRET_ACCESS_KEY
+              value: test
+            - name: AWS_REGION
+              value: us-east-1
+          command: ["sh", "-c"]
+          args:
+            - |
+              aws --endpoint-url=http://localstack.localstack:4566 secretsmanager create-secret --name staging/common-secrets --secret-string '{"username":"admin","password":"adminpass"}'
+              aws --endpoint-url=http://localstack.localstack:4566 sqs create-queue --queue-name secret-updates
+      restartPolicy: Never
+  backoffLimit: 1
