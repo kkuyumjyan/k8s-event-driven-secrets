@@ -64,8 +64,20 @@ spec:
           - --leader-elect
           - --health-probe-bind-address=:8081
         image: controller:latest
+        imagePullPolicy: IfNotPresent
         name: manager
         ports: []
+        env:
+          - name: AWS_ACCESS_KEY_ID
+            value: test
+          - name: AWS_SECRET_ACCESS_KEY
+            value: test
+          - name: AWS_REGION
+            value: us-east-1
+          - name: AWS_ENDPOINT
+            value: http://localstack.localstack:4566
+          - name: SQS_QUEUE_URL
+            value: http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/secret-updates
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
@@ -94,5 +106,5 @@ spec:
             memory: 64Mi
         volumeMounts: []
       volumes: []
-      serviceAccountName: k8s-event-driven-secrets
+      serviceAccountName: k8s-event-driven-secrets-controller-manager
       terminationGracePeriodSeconds: 10

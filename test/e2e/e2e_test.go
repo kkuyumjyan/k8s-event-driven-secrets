@@ -17,6 +17,7 @@ limitations under the License.
 package e2e
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -74,8 +75,20 @@ var _ = Describe("Manager", Ordered, func() {
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
 	// and deleting the namespace.
 	AfterAll(func() {
+		By("cleaning up EventdrivenSecret CR")
+		cmd := exec.Command("kubectl", "delete", "eventdrivensecret", "--all", "-n", "default")
+		_, _ = utils.Run(cmd)
+
+		By("cleaning up the clusterrolebinding for metrics")
+		cmd = exec.Command("kubectl", "delete", "clusterrolebinding", "k8s-event-driven-secrets-metrics-binding")
+		_, _ = utils.Run(cmd)
+
+		By("delete sqs-event job")
+		cmd = exec.Command("kubectl", "delete", "job", "send-sqs-event", "-n", "default")
+		_, _ = utils.Run(cmd)
+
 		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
+		cmd = exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)
 
 		By("undeploying the controller-manager")
@@ -143,7 +156,7 @@ var _ = Describe("Manager", Ordered, func() {
 			verifyControllerUp := func(g Gomega) {
 				// Get the name of the controller-manager pod
 				cmd := exec.Command("kubectl", "get",
-					"pods", "-l", "control-plane=controller-manager",
+					"pods", "-l", "control-plane=k8s-event-driven-secrets",
 					"-o", "go-template={{ range .items }}"+
 						"{{ if not .metadata.deletionTimestamp }}"+
 						"{{ .metadata.name }}"+
@@ -156,7 +169,7 @@ var _ = Describe("Manager", Ordered, func() {
 				podNames := utils.GetNonEmptyLines(podOutput)
 				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
 				controllerPodName = podNames[0]
-				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
+				g.Expect(controllerPodName).To(ContainSubstring("k8s-event-driven-secrets"))
 
 				// Validate the pod's status
 				cmd = exec.Command("kubectl", "get",
@@ -194,7 +207,7 @@ var _ = Describe("Manager", Ordered, func() {
 				cmd := exec.Command("kubectl", "get", "endpoints", metricsServiceName, "-n", namespace)
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("8443"), "Metrics endpoint is not ready")
+				g.Expect(output).To(ContainSubstring("8080"), "Metrics endpoint is not ready")
 			}
 			Eventually(verifyMetricsEndpointReady).Should(Succeed())
 
@@ -219,7 +232,7 @@ var _ = Describe("Manager", Ordered, func() {
 							"name": "curl",
 							"image": "curlimages/curl:latest",
 							"command": ["/bin/sh", "-c"],
-							"args": ["curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics"],
+							"args": ["curl -v -k http://%s.%s.svc.cluster.local:8080/metrics"],
 							"securityContext": {
 								"allowPrivilegeEscalation": false,
 								"capabilities": {
@@ -234,7 +247,7 @@ var _ = Describe("Manager", Ordered, func() {
 						}],
 						"serviceAccount": "%s"
 					}
-				}`, token, metricsServiceName, namespace, serviceAccountName))
+				}`, metricsServiceName, namespace, serviceAccountName))
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
 
@@ -266,6 +279,59 @@ var _ = Describe("Manager", Ordered, func() {
 		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
 		//    strings.ToLower(<Kind>),
 		// ))
+		It("should reconcile and create the target secret", func() {
+			By("applying EventDrivenSecret manifest")
+			cmd := exec.Command("kubectl", "apply", "-f", "config/samples/secrets_v1alpha1_eventdrivensecret.yaml")
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply EventDrivenSecret")
+
+			By("waiting for the target Kubernetes secret to be created")
+			verifySecretCreated := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "secret", "my-secret-1", "-n", "default")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "Secret not found")
+				g.Expect(output).To(ContainSubstring("my-secret-1"))
+			}
+			Eventually(verifySecretCreated, 30*time.Second, 2*time.Second).Should(Succeed())
+		})
+
+		It("should update the secret and rollout the deployment", func() {
+			By("creating the sample deployment")
+			cmd := exec.Command("kubectl", "apply", "-f", "config/samples/sample_deployment_managed_by_controller.yaml")
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create sample deployment")
+
+			By("running send-event job to update secret and send event to SQS")
+			cmd = exec.Command("kubectl", "apply", "-f", "test/e2e/aws/send-event-job.yaml")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to trigger send-event job")
+
+			By("waiting for secret to be updated in cluster")
+			// Base64 decode helper
+			decode := func(encoded string) string {
+				decoded, err := base64.StdEncoding.DecodeString(encoded)
+				Expect(err).NotTo(HaveOccurred())
+				return string(decoded)
+			}
+			verifySecretUpdated := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "secret", "my-secret-1", "-n", "default", "-o", "jsonpath={.data.password}")
+				encodedPassword, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+
+				password := decode(encodedPassword)
+				g.Expect(password).To(Equal("updatedadminpass"))
+			}
+			Eventually(verifySecretUpdated, 1*time.Minute).Should(Succeed())
+
+			By("verifying the deployment rollout happened")
+			verifyRollout := func(g Gomega) {
+				cmd := exec.Command("kubectl", "rollout", "status", "deployment/ubuntu-test-1", "-n", "default")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(ContainSubstring("successfully rolled out"))
+			}
+			Eventually(verifyRollout, 2*time.Minute).Should(Succeed())
+		})
 	})
 })
 

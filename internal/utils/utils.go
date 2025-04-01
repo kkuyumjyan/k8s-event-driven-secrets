@@ -7,10 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/kkuyumjyan/k8s-event-driven-secrets/api/v1alpha1"
 	"sort"
 	"sync"
 	"time"
+
+	"k8s.io/apimachinery/pkg/api/meta"
+
+	"github.com/kkuyumjyan/k8s-event-driven-secrets/api/v1alpha1"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -22,69 +25,61 @@ import (
 
 var utilsLog = ctrl.Log.WithName("utils")
 
-// ✅ Ensure a Kubernetes Secret exists and is up to date
-func CreateOrUpdateK8sSecret(ctx context.Context, k8sClient client.Client, namespace, secretName string, secretData map[string][]byte, updatedSecrets *sync.Map) error {
-	log := ctrl.Log.WithName("utils.CreateOrUpdateK8sSecret")
-	// Define a retry loop in case of conflicts
-	var existingSecret corev1.Secret
-	secretKey := client.ObjectKey{Name: secretName, Namespace: namespace}
+func AnnotateEventDrivenSecrets(ctx context.Context, eventDrivenSecrets []v1alpha1.EventDrivenSecret, kubeClient client.Client) {
+	log := utilsLog.WithName("AnnotateEventDrivenSecrets")
+	for _, eds := range eventDrivenSecrets {
+		log.Info("✏️ Updating EventDrivenSecret to trigger reconcile", "EventDrivenSecret", eds.Name)
 
-	for i := 0; i < 5; i++ { // Retry up to 5 times
-		err := k8sClient.Get(ctx, secretKey, &existingSecret)
-		if err == nil {
-			// Secret exists, update it
-			existingSecret.Data = secretData
-			if existingSecret.Labels == nil {
-				existingSecret.Labels = make(map[string]string)
-			}
-			existingSecret.Labels["eventdrivensecretsmanaged"] = "true"
+		eds.Annotations["edsm.io/last-updated"] = time.Now().Format(time.RFC3339) // ✅ Trigger reconcile
 
-			err = k8sClient.Update(ctx, &existingSecret)
-			if err == nil {
-				log.Info("🔄 Updated existing Kubernetes Secret", "secretname", secretName)
-				return nil
-			}
-
-			// 🛑 Conflict detected, retry with the latest version
-			if apierrors.IsConflict(err) {
-				log.Info("⚠️ Conflict updating secret, retrying...", secretName)
-				time.Sleep(200 * time.Millisecond) // Short wait before retrying
-				continue
-			}
-
-			// If error is not a conflict, return
-			log.Error(err, "❌ Failed to update existing Kubernetes Secret")
-			return err
+		if err := kubeClient.Update(ctx, &eds); err != nil {
+			log.Error(err, "❌ Failed to update EventDrivenSecret", "EventDrivenSecret", eds.Name)
+		} else {
+			log.Info("✅ EventDrivenSecret updated successfully", "EventDrivenSecret", eds.Name)
 		}
+	}
+}
 
-		// If secret does not exist, create it
-		newSecret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      secretName,
-				Namespace: namespace,
-				Labels: map[string]string{
-					"eventdrivensecretsmanaged": "true",
-				},
-			},
-			Data: secretData,
-			Type: corev1.SecretTypeOpaque,
-		}
+// ✅ Hash function using SHA256
+// Normalize the secret data and compute SHA256 hash
+func CalculateSHA256(secretData map[string][]byte) string {
+	// Convert map to sorted slice for deterministic JSON encoding
+	keys := make([]string, 0, len(secretData))
+	for key := range secretData {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys) // Ensure consistent ordering
 
-		if err := k8sClient.Create(ctx, newSecret); err != nil {
-			log.Error(err, "❌ Failed to create new Kubernetes Secret")
-			return err
-		}
-
-		log.Info("✅ Created new Kubernetes Secret", "secretname", secretName)
-		return nil
+	normalized := make(map[string]string)
+	for _, key := range keys {
+		normalized[key] = string(secretData[key]) // Convert bytes to string
 	}
 
-	return fmt.Errorf("❌ Failed to update Kubernetes Secret '%s' after multiple retries", secretName)
+	// ✅ Encode JSON in a consistent format (ensures deterministic hashing)
+	jsonData, _ := json.Marshal(normalized)
+
+	// ✅ Compute SHA256 hash
+	hash := sha256.Sum256(jsonData)
+	return hex.EncodeToString(hash[:])
+}
+
+func CompareSecretData(currentData map[string][]byte, expectedData map[string][]byte) bool {
+	if len(currentData) != len(expectedData) {
+		return false
+	}
+
+	for key, expectedValue := range expectedData {
+		currentValue, exists := currentData[key]
+		if !exists || !bytes.Equal(currentValue, expectedValue) {
+			return false
+		}
+	}
+	return true
 }
 
 // ✅ Compute SHA256 checksums of all secret values
 func ComputeSecretChecksums(ctx context.Context, kubeClient client.Client, namespace string, secretNames []string) (map[string]string, error) {
-	log := ctrl.Log.WithName("utils.ComputeSecretChecksums")
+	log := utilsLog.WithName("ComputeSecretChecksums")
 
 	checksums := make(map[string]string)
 
@@ -100,7 +95,7 @@ func ComputeSecretChecksums(ctx context.Context, kubeClient client.Client, names
 		log.Info("🔍 Fetched Kubernetes Secret", "secretName", secretName)
 
 		// ✅ Normalize the secret data into a consistent format before hashing
-		checksum := calculateSHA256(secret.Data)
+		checksum := CalculateSHA256(secret.Data)
 		checksums[secretName] = checksum
 
 		// 🛑 Debugging: Log calculated hash
@@ -110,10 +105,77 @@ func ComputeSecretChecksums(ctx context.Context, kubeClient client.Client, names
 	return checksums, nil
 }
 
-// ✅ Compare stored vs. new checksums
+// ✅ Ensure a Kubernetes Secret exists and is up to date
+func CreateOrUpdateK8sSecret(ctx context.Context, k8sClient client.Client, namespace, secretName string, secretData map[string][]byte, updatedSecrets *sync.Map) error {
+	log := utilsLog.WithName("CreateOrUpdateK8sSecret")
+	secretKey := client.ObjectKey{Name: secretName, Namespace: namespace}
+	var existingSecret corev1.Secret
+
+	for i := 0; i < 5; i++ {
+		err := k8sClient.Get(ctx, secretKey, &existingSecret)
+		if err == nil {
+			// ✅ Secret exists, update it
+			existingSecret.Data = secretData
+			if existingSecret.Labels == nil {
+				existingSecret.Labels = map[string]string{}
+			}
+			existingSecret.Labels["eventdrivensecretsmanaged"] = "true"
+
+			err = k8sClient.Update(ctx, &existingSecret)
+			if err == nil {
+				log.Info("🔄 Updated existing Kubernetes Secret", "secretname", secretName)
+				return nil
+			}
+			if apierrors.IsConflict(err) {
+				log.Info("⚠️ Conflict updating secret, retrying...", "secretname", secretName)
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+
+			log.Error(err, "❌ Failed to update existing Kubernetes Secret")
+			return err
+		}
+
+		if !apierrors.IsNotFound(err) {
+			log.Error(err, "❌ Failed to get Kubernetes Secret")
+			return err
+		}
+
+		// ❌ NotFound — try to create it
+		newSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: namespace,
+				Labels: map[string]string{
+					"eventdrivensecretsmanaged": "true",
+				},
+			},
+			Data: secretData,
+			Type: corev1.SecretTypeOpaque,
+		}
+
+		err = k8sClient.Create(ctx, newSecret)
+		if err == nil {
+			log.Info("✅ Created new Kubernetes Secret", "secretname", secretName)
+			return nil
+		}
+
+		if apierrors.IsAlreadyExists(err) {
+			log.Info("⚠️ Secret already exists, retrying get-update flow", "secretname", secretName)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		log.Error(err, "❌ Failed to create new Kubernetes Secret")
+		return err
+	}
+
+	return fmt.Errorf("❌ Failed to update or create Kubernetes Secret '%s' after multiple retries", secretName)
+}
+
 // ✅ Compare stored vs. new checksums with detailed logging
 func IsSecretChanged(storedChecksums, newChecksums map[string]string) bool {
-	log := ctrl.Log.WithName("utils.IsSecretChanged")
+	log := utilsLog.WithName("IsSecretChanged")
 
 	// If storedChecksums is empty, consider it a change (first-time case)
 	if len(storedChecksums) == 0 {
@@ -142,32 +204,17 @@ func IsSecretChanged(storedChecksums, newChecksums map[string]string) bool {
 	return false
 }
 
-// ✅ Hash function using SHA256
-// Normalize the secret data and compute SHA256 hash
-func calculateSHA256(secretData map[string][]byte) string {
-	// Convert map to sorted slice for deterministic JSON encoding
-	keys := make([]string, 0, len(secretData))
+func MaskSecretData(secretData map[string][]byte) map[string]string {
+	maskedData := make(map[string]string)
 	for key := range secretData {
-		keys = append(keys, key)
+		maskedData[key] = "********"
 	}
-	sort.Strings(keys) // Ensure consistent ordering
-
-	normalized := make(map[string]string)
-	for _, key := range keys {
-		normalized[key] = string(secretData[key]) // Convert bytes to string
-	}
-
-	// ✅ Encode JSON in a consistent format (ensures deterministic hashing)
-	jsonData, _ := json.Marshal(normalized)
-
-	// ✅ Compute SHA256 hash
-	hash := sha256.Sum256(jsonData)
-	return hex.EncodeToString(hash[:])
+	return maskedData
 }
 
 // ✅ Rollout deployments if secrets have changed
 func RolloutDeploymentsSecretUpdate(ctx context.Context, kubeClient client.Client, updatedSecretName, namespace string) error {
-	log := ctrl.Log.WithName("utils.RolloutDeployments")
+	log := utilsLog.WithName("RolloutDeployments")
 
 	log.Info("🚀 Calling RolloutDeploymentsSecretUpdate for deployments using", "secret", updatedSecretName, "namespace", namespace)
 	// Fetch deployments that reference the updated secret using the index
@@ -253,39 +300,13 @@ func RolloutDeploymentsSecretUpdate(ctx context.Context, kubeClient client.Clien
 	return nil
 }
 
-func CompareSecretData(currentData map[string][]byte, expectedData map[string][]byte) bool {
-	if len(currentData) != len(expectedData) {
-		return false
-	}
-
-	for key, expectedValue := range expectedData {
-		currentValue, exists := currentData[key]
-		if !exists || !bytes.Equal(currentValue, expectedValue) {
-			return false
-		}
-	}
-	return true
-}
-
-func MaskSecretData(secretData map[string][]byte) map[string]string {
-	maskedData := make(map[string]string)
-	for key := range secretData {
-		maskedData[key] = "********"
-	}
-	return maskedData
-}
-
-func AnnotateEventDrivenSecrets(ctx context.Context, eventDrivenSecrets []v1alpha1.EventDrivenSecret, kubeClient client.Client) {
-	log := ctrl.Log.WithName("utils.AnnotateEventDrivenSecrets")
-	for _, eds := range eventDrivenSecrets {
-		log.Info("✏️ Updating EventDrivenSecret to trigger reconcile", "EventDrivenSecret", eds.Name)
-
-		eds.Annotations["edsm.io/last-updated"] = time.Now().Format(time.RFC3339) // ✅ Trigger reconcile
-
-		if err := kubeClient.Update(ctx, &eds); err != nil {
-			log.Error(err, "❌ Failed to update EventDrivenSecret", "EventDrivenSecret", eds.Name)
-		} else {
-			log.Info("✅ EventDrivenSecret updated successfully", "EventDrivenSecret", eds.Name)
-		}
-	}
+// SetReadyCondition sets the Ready condition on the EventDrivenSecret status
+func SetReadyCondition(eds *v1alpha1.EventDrivenSecret, status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&eds.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: metav1.NewTime(time.Now()),
+	})
 }

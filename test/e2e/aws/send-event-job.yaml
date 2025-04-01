@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: send-sqs-event
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+        - name: aws-cli
+          image: amazon/aws-cli
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: test
+            - name: AWS_SECRET_ACCESS_KEY
+              value: test
+            - name: AWS_REGION
+              value: us-east-1
+          command: [ "sh", "-c" ]
+          args:
+            - |
+              ARN=$(aws --endpoint-url=http://localstack.localstack:4566 secretsmanager list-secrets \
+                    --query "SecretList[?Name=='staging/common-secrets'].ARN" \
+                    --output text)
+
+              echo "📨 Sending message with ARN: $ARN"
+
+              # ✅ Update existing secret instead of creating it
+              aws --endpoint-url=http://localstack.localstack:4566 secretsmanager update-secret \
+                --secret-id staging/common-secrets \
+                --secret-string '{"username":"admin","password":"updatedadminpass"}'
+
+              # ✅ Send SQS event with updated ARN
+              aws --endpoint-url=http://localstack.localstack:4566 sqs send-message \
+                --queue-url http://localstack.localstack:4566/000000000000/secret-updates \
+                --message-body "{\"detail\": {\"eventName\": \"SecretUpdated\", \"awsRegion\": \"us-east-1\", \"requestParameters\": {\"secretId\": \"$ARN\"}}}"
+      restartPolicy: Never
+  backoffLimit: 1

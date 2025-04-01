@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sync"
 	"time"
+
+	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -14,16 +15,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	secretsv1alpha1 "github.com/kkuyumjyan/k8s-event-driven-secrets/api/v1alpha1"
-	utils "github.com/kkuyumjyan/k8s-event-driven-secrets/internal/utils"
+	"github.com/kkuyumjyan/k8s-event-driven-secrets/internal/utils"
 )
 
-var log = ctrl.Log.WithName("sqs")
+var sqslog = ctrl.Log.WithName("sqs")
 
 // SQSListener listens for messages from AWS SQS and triggers reconciliations
 type SQSListener struct {
 	client.Client
 	QueueURL          string
 	SQSUpdatedSecrets *sync.Map
+	Endpoint          string // Optional: used for local testing (e.g., LocalStack)
 }
 
 // SQSMessage represents the event structure from AWS SecretsManager
@@ -38,7 +40,7 @@ type SQSMessage struct {
 }
 
 func (s *SQSListener) handleSQSEvent(ctx context.Context, msg string) {
-	log := log.WithName("SQSListener.handleSQSEvent")
+	log := sqslog.WithName("SQSListener.handleSQSEvent")
 
 	log.Info("📩 Received SQS Event")
 
@@ -58,7 +60,10 @@ func (s *SQSListener) handleSQSEvent(ctx context.Context, msg string) {
 		return
 	}
 
-	provider := &AWSSecretManagerProvider{}
+	provider := &AWSSecretManagerProvider{
+		Region:   region,
+		Endpoint: s.Endpoint,
+	}
 
 	// ✅ Fetch the user-visible name instead of stripping
 	secretPath, err := provider.fetchSecretName(ctx, region, fullSecretID)
@@ -97,7 +102,7 @@ func (s *SQSListener) handleSQSEvent(ctx context.Context, msg string) {
 
 // Find EventDrivenSecrets that reference the given AWS Secret ARN
 func (s *SQSListener) findMatchingEventDrivenSecrets(ctx context.Context, secretPath string) ([]secretsv1alpha1.EventDrivenSecret, error) {
-	log := log.WithName("SQSListener.findMatchingEventDrivenSecrets")
+	log := sqslog.WithName("findMatchingEventDrivenSecrets")
 
 	var eventDrivenSecretList secretsv1alpha1.EventDrivenSecretList
 	err := s.List(ctx, &eventDrivenSecretList, client.MatchingFields{
@@ -113,7 +118,7 @@ func (s *SQSListener) findMatchingEventDrivenSecrets(ctx context.Context, secret
 
 // StartListening continuously polls AWS SQS for secret update events
 func (s *SQSListener) StartListening(ctx context.Context, queueURL string) {
-	log := log.WithName("SQSListener.StartListening")
+	log := sqslog.WithName("SQSListener.StartListening")
 
 	// Read SQS Queue URL from ENV variable
 	if queueURL == "" {
@@ -128,7 +133,12 @@ func (s *SQSListener) StartListening(ctx context.Context, queueURL string) {
 		return
 	}
 
-	sqsClient := sqs.NewFromConfig(cfg)
+	sqsClient := sqs.NewFromConfig(cfg, func(o *sqs.Options) {
+		if s.Endpoint != "" {
+			o.BaseEndpoint = aws.String(s.Endpoint)
+			fmt.Println("Using custom endpoint:", s.Endpoint)
+		}
+	})
 
 	for {
 		// Fetch messages from SQS

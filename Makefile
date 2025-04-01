@@ -1,6 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG_VERSION ?= latest
-IMG ?= kkuyumjyan/k8s-event-driven-secrets:${IMG_VERSION}
+IMG ?= kkuyumjyan/k8s-event-driven-secrets:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -44,7 +43,7 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) rbac:roleName=event-driven-secrets-manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -67,12 +66,12 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
 .PHONY: test-e2e
-test-e2e: manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
+test-e2e: manifests generate fmt vet e2e-setup ## Run the e2e tests. Expected an isolated environment using Kind.
 	@command -v kind >/dev/null 2>&1 || { \
 		echo "Kind is not installed. Please install Kind manually."; \
 		exit 1; \
 	}
-	@kind get clusters | grep -q 'kind' || { \
+	@kind get clusters | grep -q 'eventdriven-secrets' || { \
 		echo "No Kind cluster is running. Please start a Kind cluster before running the e2e tests."; \
 		exit 1; \
 	}
@@ -191,7 +190,7 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen,$(CONTROLLER_TOOLS_VERSION))
 
 .PHONY: setup-envtest
-setup-envtest: envtest ## Download the binaries required for ENVTEST in the local bin directory.
+setup-envtest: kind-up localstack-install install envtest ## Download the binaries required for ENVTEST in the local bin directory.
 	@echo "Setting up envtest binaries for Kubernetes version $(ENVTEST_K8S_VERSION)..."
 	@$(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path || { \
 		echo "Error: Failed to set up envtest binaries for version $(ENVTEST_K8S_VERSION)."; \
@@ -223,3 +222,80 @@ mv $(1) $(1)-$(3) ;\
 } ;\
 ln -sf $(1)-$(3) $(1)
 endef
+
+##@ E2E Testing with Kind + LocalStack
+
+KIND_CLUSTER_NAME ?= eventdriven-secrets
+KIND_CLUSTER_CONFIG ?= test/e2e/kind-cluster.yaml
+
+.PHONY: kind-up
+kind-up: ## Create a local Kind cluster for E2E testing
+	@if kind get clusters | grep -q "^$(KIND_CLUSTER_NAME)$$"; then \
+		echo "Kind cluster '$(KIND_CLUSTER_NAME)' already exists. Skipping creation."; \
+	else \
+		echo "Creating Kind cluster '$(KIND_CLUSTER_NAME)'..."; \
+		kind create cluster --name $(KIND_CLUSTER_NAME) --config $(KIND_CLUSTER_CONFIG); \
+	fi
+	@echo "✅ Kind cluster ready. Current context:" $$(kubectl config current-context)
+
+.PHONY: kind-down
+kind-down: ## Delete the local Kind cluster
+	kind delete cluster --name $(KIND_CLUSTER_NAME)
+
+.PHONY: kind-load-image
+kind-load-image: ## Load the controller image into Kind
+	kind load docker-image $(IMG) --name $(KIND_CLUSTER_NAME)
+
+.PHONY: localstack-install
+localstack-install: ## Install LocalStack via Helm inside the Kind cluster
+	@echo "Switching kubectl context to Kind cluster: $(KIND_CLUSTER_NAME)"
+	kubectl config use-context kind-$(KIND_CLUSTER_NAME)
+
+	@echo "Adding LocalStack Helm repo"
+	helm repo add localstack https://localstack.github.io/helm-charts || true
+	helm repo update
+
+	@echo "Installing LocalStack via Helm"
+	helm upgrade --install localstack localstack/localstack \
+    		--namespace localstack --create-namespace \
+    		--values test/e2e/aws/localstack-values.yaml
+
+.PHONY: debug-aws-cli
+debug-aws-cli:
+	kubectl run aws-cli-debug \
+	  --image=amazon/aws-cli \
+	  --restart=Never \
+	  --env AWS_ACCESS_KEY_ID=test \
+	  --env AWS_SECRET_ACCESS_KEY=test \
+	  --env AWS_REGION=us-east-1 \
+	  --env AWS_DEFAULT_REGION=us-east-1 \
+	  --command -- /bin/sh -c "while true; do sleep 3600; done"
+	kubectl wait --for=condition=Ready pod/aws-cli-debug --timeout=30s
+	kubectl exec -it aws-cli-debug -- sh
+
+.PHONY: destroy-debug-aws-cli
+destroy-debug-aws-cli:
+	kubectl delete pod aws-cli-debug --ignore-not-found
+
+.PHONY: bootstrap-e2e
+bootstrap-e2e:
+	kubectl apply -f config/samples/secrets_v1alpha1_eventdrivensecret.yaml
+	kubectl apply -f config/samples/sample_deployment_managed_by_controller.yaml
+	kubectl apply -f test/e2e/aws/bootstrap-job.yaml
+
+.PHONY: e2e-trigger-event
+e2e-trigger-event:
+	kubectl apply -f test/e2e/aws/send-event-job.yaml
+
+.PHONY: e2e-setup
+e2e-setup: kind-up localstack-install docker-build kind-load-image install bootstrap-e2e
+
+
+.PHONY: update-e2e-controller restart-controller
+
+update-e2e-controller: docker-build kind-load-image restart-controller
+
+restart-controller:
+	kubectl patch deployment k8s-event-driven-secrets-k8s-event-driven-secrets \
+		-n k8s-event-driven-secrets-system \
+		-p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"restarted-at\":\"$$(date +'%s')\"}}}}}"

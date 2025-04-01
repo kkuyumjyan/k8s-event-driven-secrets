@@ -3,16 +3,17 @@ package providers
 import (
 	"context"
 	"fmt"
+	"os"
+
 	"github.com/kkuyumjyan/k8s-event-driven-secrets/api/v1alpha1"
 	"github.com/kkuyumjyan/k8s-event-driven-secrets/internal/providers/aws"
 	"github.com/kkuyumjyan/k8s-event-driven-secrets/internal/providers/gcp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sync"
 )
 
 type Provider interface {
 	FetchSecretData(ctx context.Context, secretPath string) (map[string][]byte, error)
-	StartListening(ctx context.Context, k8sClient client.Client, updatedSecrets *sync.Map) error
+	StartListening(ctx context.Context, k8sClient client.Client) error
 }
 
 func NewProvider(cloudProvider string, options v1alpha1.CloudProviderOptions) (Provider, error) {
@@ -22,7 +23,8 @@ func NewProvider(cloudProvider string, options v1alpha1.CloudProviderOptions) (P
 			return nil, fmt.Errorf("region is required for the AWS provider")
 		}
 		provider := &aws.AWSSecretManagerProvider{
-			Region: options.Region,
+			Region:   options.Region,
+			Endpoint: os.Getenv("AWS_ENDPOINT"),
 		}
 		return provider, nil
 	case "gcp":
